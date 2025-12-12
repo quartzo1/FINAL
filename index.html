@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Blob / Moons Classifier (MLP)</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 16px;
+      background: #f4f4f4;
+    }
+    h2 { margin-top: 0; }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      padding: 12px;
+      background: #fff;
+      border-radius: 6px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      margin-bottom: 10px;
+      align-items: flex-end;
+    }
+    .control-group {
+      display: flex;
+      flex-direction: column;
+      font-size: 12px;
+    }
+    .control-group input,
+    .control-group select {
+      padding: 4px 6px;
+      font-size: 12px;
+      min-width: 80px;
+    }
+    label {
+      font-size: 11px;
+      margin-bottom: 2px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: #444;
+    }
+    button {
+      padding: 6px 12px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      background: #1976d2;
+      color: #fff;
+    }
+    button.secondary { background: #555; }
+    button.danger { background: #c62828; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .status-bar {
+      margin: 6px 0 12px;
+      font-size: 13px;
+    }
+    .canvas-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
+    }
+    canvas {
+      background: #ffffff;
+      border-radius: 6px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+    .note {
+      font-size: 11px;
+      margin-top: 6px;
+      max-width: 600px;
+    }
+  </style>
+</head>
+<body>
+  <h2>Blob / Moons Classifier (MLP)</h2>
+
+  <div class="controls">
+    <div class="control-group">
+      <label for="hiddenLayers">Hidden layers</label>
+      <input id="hiddenLayers" type="text" value="16,16">
+    </div>
+    <div class="control-group">
+      <label for="lr">Learning rate</label>
+      <input id="lr" type="number" step="0.001" value="0.01">
+    </div>
+    <div class="control-group">
+      <label for="epochs">Epochs</label>
+      <input id="epochs" type="number" value="400">
+    </div>
+    <div class="control-group">
+      <label for="points">Points / class</label>
+      <input id="points" type="number" value="200">
+    </div>
+    <div class="control-group">
+      <label for="variance">Variance</label>
+      <input id="variance" type="number" step="0.01" value="0.05">
+    </div>
+    <div class="control-group">
+      <label for="dataset">Dataset</label>
+      <select id="dataset">
+        <option value="quadrant">Quadrant Blobs (4 classes)</option>
+        <option value="moon">Moons (2 classes)</option>
+        <option value="diag3">Diagonal 3-Class</option>
+      </select>
+    </div>
+    <div class="control-group">
+      <label for="moonGap">Moon gap</label>
+      <input id="moonGap" type="number" step="0.01" value="0.07">
+    </div>
+    <div class="control-group">
+      <label>
+        <input id="showBoundary" type="checkbox" checked>
+        Boundary
+      </label>
+    </div>
+    <div class="control-group">
+      <label>&nbsp;</label>
+      <button id="btnGenerate">Generate</button>
+    </div>
+    <div class="control-group">
+      <label>&nbsp;</label>
+      <button id="btnTrain">Start training</button>
+    </div>
+    <div class="control-group">
+      <label>&nbsp;</label>
+      <button id="btnStop" class="danger">Stop</button>
+    </div>
+    <div class="control-group">
+      <label>&nbsp;</label>
+      <button id="btnReset" class="secondary">Reset NN</button>
+    </div>
+  </div>
+
+  <div class="status-bar">
+    <span id="statusText">Idle</span> |
+    <span id="epochText">Epoch: 0 / 0</span> |
+    <span id="lossText">Loss: -</span>
+  </div>
+
+  <div class="canvas-row">
+    <div>
+      <canvas id="plot" width="500" height="500"></canvas>
+      <div class="note">Decision boundary updates as training progresses.</div>
+    </div>
+    <div>
+      <canvas id="nnCanvas" width="350" height="300"></canvas>
+      <div class="note">Neural network visualizer.</div>
+    </div>
+  </div>
+
+<script>
+  // ---------- Globals ----------
+  let model = null;
+  let xs = null;
+  let ys = null;
+  let numClasses = 0;
+  let isTraining = false;
+  let stopRequested = false;
+
+  const COLORS    = ['#d62728', '#2ca02c', '#1f77b4', '#ff7f0e']; // red, green, blue, orange
+  const BG_COLORS = ['#ffcdd2', '#c8e6c9', '#cfe2ff', '#ffe0b2'];
+
+  const plotCanvas = document.getElementById('plot');
+  const plotCtx    = plotCanvas.getContext('2d');
+  const nnCanvas   = document.getElementById('nnCanvas');
+  const nnCtx      = nnCanvas.getContext('2d');
+
+  const statusText = document.getElementById('statusText');
+  const epochText  = document.getElementById('epochText');
+  const lossText   = document.getElementById('lossText');
+
+  const datasetSelect = document.getElementById('dataset');
+  const moonGapInput  = document.getElementById('moonGap');
+
+  datasetSelect.addEventListener('change', () => {
+    moonGapInput.disabled = datasetSelect.value !== 'moon';
+  });
+
+  // ---------- Random utilities ----------
+  function randn_bm() {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+
+  function sampleGaussian(cx, cy, variance) {
+    const x = cx + randn_bm() * variance;
+    const y = cy + randn_bm() * variance;
+    return [
+      Math.min(1, Math.max(0, x)),
+      Math.min(1, Math.max(0, y))
+    ];
+  }
+
+  // ---------- Data generation ----------
+  function generateData() {
+    const variance = parseFloat(document.getElementById('variance').value) || 0.05;
+    const pointsPerClass = parseInt(document.getElementById('points').value) || 200;
+    const dataset = datasetSelect.value;
+    const gap = parseFloat(moonGapInput.value) || 0.07;
+
+    const data = [];
+    const labels = [];
+
+    if (dataset === 'quadrant') {
+      numClasses = 4;
+      const centers = [
+        [0.25, 0.25], // bottom-left
+        [0.75, 0.25], // bottom-right
+        [0.25, 0.75], // top-left
+        [0.75, 0.75]  // top-right
+      ];
+      for (let c = 0; c < 4; c++) {
+        for (let i = 0; i < pointsPerClass; i++) {
+          data.push(sampleGaussian(centers[c][0], centers[c][1], variance));
+          labels.push(c);
+        }
+      }
+
+    } else if (dataset === 'moon') {
+      // Messy crescent moons
+      numClasses = 2;
+      const n = pointsPerClass;
+
+      // TOP moon
+      for (let i = 0; i < n; i++) {
+        const t = Math.random() * Math.PI; // [0, π]
+        let x = 0.35 * Math.cos(t) + 0.5;
+        let y = 0.35 * Math.sin(t) + 0.6;
+        x += randn_bm() * variance * 1.2;
+        y += randn_bm() * variance * 1.2;
+        x = Math.min(1, Math.max(0, x));
+        y = Math.min(1, Math.max(0, y));
+        data.push([x, y]);
+        labels.push(0);
+      }
+
+      // BOTTOM moon
+      for (let i = 0; i < n; i++) {
+        const t = Math.random() * Math.PI;
+        let x = 0.35 * Math.cos(t) + 0.55;
+        let y = -0.35 * Math.sin(t) + (0.4 - gap);
+        x += randn_bm() * variance * 1.2;
+        y += randn_bm() * variance * 1.2;
+        x = Math.min(1, Math.max(0, x));
+        y = Math.min(1, Math.max(0, y));
+        data.push([x, y]);
+        labels.push(1);
+      }
+
+    } else if (dataset === 'diag3') {
+      // Diagonal 3-Class: 4 blobs, 3 classes.
+      //   top-left:    red   (class 0)
+      //   top-right:   green (class 1)
+      //   bottom-left: blue  (class 2)
+      //   bottom-right:red   (class 0 again)
+      numClasses = 3;
+
+      const centers = [
+        [0.25, 0.75], // top-left  red   → class 0
+        [0.75, 0.75], // top-right green → class 1
+        [0.25, 0.25], // bottom-left blue → class 2
+        [0.75, 0.25]  // bottom-right red → class 0 (duplicate)
+      ];
+      const classLabels = [0, 1, 2, 0];
+
+      for (let b = 0; b < 4; b++) {
+        for (let i = 0; i < pointsPerClass; i++) {
+          data.push(sampleGaussian(centers[b][0], centers[b][1], variance));
+          labels.push(classLabels[b]);
+        }
+      }
+    }
+
+    // Update tensors
+    if (xs) xs.dispose();
+    if (ys) ys.dispose();
+
+    xs = tf.tensor2d(data);
+    const labelTensor = tf.tensor1d(labels, 'int32');
+    ys = tf.oneHot(labelTensor, numClasses);
+    labelTensor.dispose();
+
+    statusText.textContent = `Data generated (${numClasses} classes)`;
+    buildModel();
+    drawDataOnly();
+  }
+
+  // ---------- Model ----------
+  function parseHiddenLayers() {
+    const text = document.getElementById('hiddenLayers').value;
+    const parts = text.split(',')
+      .map(s => parseInt(s.trim(), 10))
+      .filter(n => !isNaN(n) && n > 0);
+    return parts.length ? parts : [16, 16];
+  }
+
+  function buildModel() {
+    if (model) {
+      model.dispose();
+      model = null;
+    }
+    const hiddenSizes = parseHiddenLayers();
+    const lr = parseFloat(document.getElementById('lr').value) || 0.01;
+
+    const m = tf.sequential();
+    m.add(tf.layers.dense({
+      units: hiddenSizes[0],
+      inputShape: [2],
+      activation: 'relu'
+    }));
+    for (let i = 1; i < hiddenSizes.length; i++) {
+      m.add(tf.layers.dense({
+        units: hiddenSizes[i],
+        activation: 'relu'
+      }));
+    }
+    m.add(tf.layers.dense({
+      units: numClasses,
+      activation: 'softmax'
+    }));
+
+    const optimizer = tf.train.adam(lr);
+    m.compile({
+      optimizer,
+      loss: 'categoricalCrossentropy'
+    });
+
+    model = m;
+    drawNetwork();
+  }
+
+  async function trainModel() {
+    if (!xs || !ys) {
+      alert('Generate data first.');
+      return;
+    }
+    if (!model) {
+      buildModel();
+    }
+    if (isTraining) return;
+
+    const totalEpochs = parseInt(document.getElementById('epochs').value) || 400;
+    isTraining = true;
+    stopRequested = false;
+    document.getElementById('btnTrain').disabled = true;
+    statusText.textContent = 'Training...';
+
+    for (let epoch = 1; epoch <= totalEpochs; epoch++) {
+      if (stopRequested) break;
+
+      const h = await model.fit(xs, ys, {
+        epochs: 1,
+        batchSize: 32,
+        shuffle: true,
+        verbose: 0
+      });
+
+      const loss = h.history.loss[0].toFixed(4);
+      epochText.textContent = `Epoch: ${epoch} / ${totalEpochs}`;
+      lossText.textContent = `Loss: ${loss}`;
+
+      await drawDecisionBoundary();
+      drawDataOnly(true);
+      drawNetwork();
+
+      await tf.nextFrame();
+    }
+
+    isTraining = false;
+    document.getElementById('btnTrain').disabled = false;
+    statusText.textContent = stopRequested ? 'Stopped.' : 'Training complete.';
+    stopRequested = false;
+  }
+
+  // ---------- Plotting ----------
+  function clearPlot(color = '#ffffff') {
+    plotCtx.fillStyle = color;
+    plotCtx.fillRect(0, 0, plotCanvas.width, plotCanvas.height);
+  }
+
+  async function drawDecisionBoundary() {
+    if (!model) return;
+    if (!document.getElementById('showBoundary').checked) {
+      clearPlot('#ffffff');
+      return;
+    }
+
+    const W = plotCanvas.width;
+    const H = plotCanvas.height;
+    const gridSize = 160;          // smaller squares → smoother curves
+    const cellW = W / gridSize;
+    const cellH = H / gridSize;
+
+    const gridPoints = [];
+    for (let gy = 0; gy < gridSize; gy++) {
+      for (let gx = 0; gx < gridSize; gx++) {
+        const x = gx / (gridSize - 1);
+        const y = gy / (gridSize - 1);
+        gridPoints.push([x, 1 - y]); // invert y for plotting
+      }
+    }
+
+    const gridXs = tf.tensor2d(gridPoints);
+    const preds = model.predict(gridXs).argMax(-1);
+    const predData = await preds.data();
+    gridXs.dispose();
+    preds.dispose();
+
+    clearPlot('#ffffff');
+
+    let idx = 0;
+    for (let gy = 0; gy < gridSize; gy++) {
+      for (let gx = 0; gx < gridSize; gx++) {
+        const cls = predData[idx++];
+        plotCtx.fillStyle = BG_COLORS[cls % BG_COLORS.length];
+        const x = gx * cellW;
+        const y = gy * cellH;
+        plotCtx.fillRect(x, y, cellW + 1, cellH + 1);
+      }
+    }
+  }
+
+  function drawDataOnly(skipClear) {
+    if (!xs) {
+      if (!skipClear) clearPlot('#ffffff');
+      return;
+    }
+    const data = xs.arraySync();
+    const labels = ys.argMax(-1).arraySync();
+
+    if (!skipClear) clearPlot('#ffffff');
+
+    const W = plotCanvas.width;
+    const H = plotCanvas.height;
+
+    for (let i = 0; i < data.length; i++) {
+      const [x, y] = data[i];
+      const cls = labels[i];
+      const px = x * W;
+      const py = H - y * H;
+      plotCtx.beginPath();
+      plotCtx.arc(px, py, 3, 0, 2 * Math.PI);
+      plotCtx.fillStyle = COLORS[cls % COLORS.length];
+      plotCtx.fill();
+    }
+  }
+
+  // ---------- NN visualizer ----------
+  function drawNetwork() {
+    nnCtx.fillStyle = '#ffffff';
+    nnCtx.fillRect(0, 0, nnCanvas.width, nnCanvas.height);
+    if (!model) return;
+
+    const sizes = [2];
+    model.layers.forEach(layer => {
+      if (layer.units !== undefined) sizes.push(layer.units);
+    });
+
+    const W = nnCanvas.width;
+    const H = nnCanvas.height;
+    const padX = 40;
+    const padY = 30;
+    const L = sizes.length;
+    const layerDist = (W - 2 * padX) / (L - 1);
+
+    const positions = [];
+    for (let li = 0; li < L; li++) {
+      const n = sizes[li];
+      const x = padX + li * layerDist;
+      const layerPos = [];
+      const totalH = H - 2 * padY;
+      const stepY = n > 1 ? totalH / (n - 1) : 0;
+      for (let ni = 0; ni < n; ni++) {
+        const y = padY + (n > 1 ? ni * stepY : totalH / 2);
+        layerPos.push({ x, y });
+      }
+      positions.push(layerPos);
+    }
+
+    // Collect weights and max magnitude
+    const weightMatrices = [];
+    let maxAbsWeight = 0;
+    model.layers.forEach(layer => {
+      const ws = layer.getWeights();
+      if (ws && ws.length > 0) {
+        const w = ws[0].arraySync(); // [in, out]
+        weightMatrices.push(w);
+        for (let i = 0; i < w.length; i++) {
+          for (let j = 0; j < w[0].length; j++) {
+            const v = Math.abs(w[i][j]);
+            if (v > maxAbsWeight) maxAbsWeight = v;
+          }
+        }
+      }
+    });
+
+    // Draw connections
+    nnCtx.lineWidth = 1;
+    for (let l = 0; l < weightMatrices.length; l++) {
+      const w = weightMatrices[l];
+      const fromLayer = positions[l];
+      const toLayer = positions[l + 1];
+      for (let i = 0; i < w.length; i++) {
+        for (let j = 0; j < w[0].length; j++) {
+          const weight = w[i][j];
+          const alpha = maxAbsWeight > 0 ? Math.min(0.9, Math.abs(weight) / maxAbsWeight) : 0.3;
+          nnCtx.globalAlpha = alpha;
+          nnCtx.strokeStyle = weight >= 0 ? '#1976d2' : '#c62828';
+          nnCtx.beginPath();
+          nnCtx.moveTo(fromLayer[i].x, fromLayer[i].y);
+          nnCtx.lineTo(toLayer[j].x, toLayer[j].y);
+          nnCtx.stroke();
+        }
+      }
+    }
+    nnCtx.globalAlpha = 1.0;
+
+    // Draw nodes
+    for (let li = 0; li < positions.length; li++) {
+      const layer = positions[li];
+      for (let ni = 0; ni < layer.length; ni++) {
+        const { x, y } = layer[ni];
+        nnCtx.beginPath();
+        nnCtx.arc(x, y, 8, 0, 2 * Math.PI);
+        nnCtx.fillStyle = '#ffffff';
+        nnCtx.fill();
+        nnCtx.strokeStyle = '#333333';
+        nnCtx.lineWidth = 1;
+        nnCtx.stroke();
+      }
+    }
+  }
+
+  // ---------- Reset ----------
+  function resetModel() {
+    stopRequested = true;
+    isTraining = false;
+    if (model) { model.dispose(); model = null; }
+    if (xs) { xs.dispose(); xs = null; }
+    if (ys) { ys.dispose(); ys = null; }
+
+    clearPlot('#ffffff');
+    nnCtx.fillStyle = '#ffffff';
+    nnCtx.fillRect(0, 0, nnCanvas.width, nnCanvas.height);
+
+    statusText.textContent = 'NN reset.';
+    epochText.textContent = 'Epoch: 0 / 0';
+    lossText.textContent = 'Loss: -';
+  }
+
+  // ---------- Button wiring ----------
+  document.getElementById('btnGenerate').addEventListener('click', generateData);
+  document.getElementById('btnTrain').addEventListener('click', trainModel);
+  document.getElementById('btnStop').addEventListener('click', () => {
+    stopRequested = true;
+    statusText.textContent = 'Stopping after current epoch...';
+  });
+  document.getElementById('btnReset').addEventListener('click', resetModel);
+
+  // ---------- Initial ----------
+  generateData();
+  drawDataOnly();
+</script>
+</body>
+</html>
